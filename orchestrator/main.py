@@ -36,64 +36,77 @@ def health():
     return "OK", 200  # ✅ healthcheck 會用到這個
 
 
-# 將舊code送給後端的地方
-@app.route('/process-project', methods=['POST'])
-def process_project():
-    data = request.json
-    files = data.get('files', [])
-    prompt = data.get('prompt', '')  
-
-    updated_files = []
-    for file in files:
-        file_name = file.get('fileName', 'unknown_file')
-        old_code = file.get('oldCode', '')
-
-        if not old_code:
-            continue
-
-        # 🔹 依照類別選擇不同的處理方式
-        modified_code = f"# Prompt: {prompt}\n{old_code}"
-
-        advice = f"**建議:** `{file_name}` 需要更好的錯誤處理。\n\n"
-        advice += f"使用者輸入的 Prompt:\n> {prompt}\n\n"
-        advice += "### 可能的解決方案:\n"
-        advice += "```python\n# 這是範例程式碼\nprint('Hello, world!')\n```"
-
-
-        updated_files.append({
-            'fileName': file_name,
-            'oldCode': old_code,
-            'newCode': modified_code,
-            'advice': advice
-        })
-
-    return jsonify({'files': updated_files})
-
-
-
-
-@app.route('/test-project', methods=['POST'])
-def test_project():
+# 統一處理：轉發 unified_operation 請求
+@app.route('/api/unified_operation', methods=['POST'])
+def unified_operation():
+    payload = request.get_json()
     try:
-        data = request.get_json()
-        files = data.get("files", [])
-
-        project_dir = "temp_project"
-        os.makedirs(project_dir, exist_ok=True)
-
-        # 將所有程式碼寫入暫存目錄
-        for file in files:
-            file_path = os.path.join(project_dir, file["fileName"])
-            os.makedirs(os.path.dirname(file_path), exist_ok=True)
-            with open(file_path, "w", encoding="utf-8") as f:
-                f.write(file["newCode"] or file["oldCode"])
-
-        # 執行測試（這裡假設 Python 專案有 `pytest`）
-        result = subprocess.run(["pytest", project_dir], capture_output=True, text=True, timeout=10)
-
-        return jsonify({"output": result.stdout, "error": result.stderr})
+        response = requests.post(
+            'http://140.120.14.104:12345/llm/code/unified_operation',
+            json=payload
+        )
+        response.raise_for_status()
+        return jsonify(response.json()), response.status_code
     except Exception as e:
-        return jsonify({"error": str(e)}), 500
+        return jsonify({'error': str(e)}), 500
+
+# 轉發部署檔案 (Dockerfile & YAML) 請求
+@app.route('/api/deployment_files', methods=['POST'])
+def deployment_files():
+    payload = request.get_json()
+    try:
+        response = requests.post(
+            'http://140.120.14.104:12345/llm/code/deployment_files',
+            json=payload
+        )
+        response.raise_for_status()
+        return jsonify(response.json()), response.status_code
+    except Exception as e:
+        return jsonify({'error': str(e)}), 500
+
+# 轉發產生 UnitTest 的請求
+@app.route('/api/unit_test', methods=['POST'])
+def unit_test():
+    payload = request.get_json()
+    try:
+        response = requests.post(
+            'http://140.120.14.104:12345/llm/code/unit_test',
+            json=payload
+        )
+        response.raise_for_status()
+        return jsonify(response.json()), response.status_code
+    except Exception as e:
+        return jsonify({'error': str(e)}), 500
+
+# 轉發多檔案處理請求
+@app.route('/api/process_multi_files', methods=['POST'])
+def process_multi_files():
+    payload = request.get_json()
+    try:
+        response = requests.post(
+            'http://140.120.14.104:12345/llm/code/process_multi_files',
+            json=payload
+        )
+        response.raise_for_status()
+        return jsonify(response.json()), response.status_code
+    except Exception as e:
+        return jsonify({'error': str(e)}), 500
+
+# 轉發 GKE 部屬請求
+@app.route('/api/deploy', methods=['POST'])
+def deploy():
+    payload = request.get_json()
+    try:
+        response = requests.post(
+            'http://34.170.57.238/deploy',
+            json=payload,
+            timeout=100  # 設定超時
+        )
+        response.raise_for_status()
+        return jsonify(response.json()), response.status_code
+    except Exception as e:
+        return jsonify({'error': str(e)}), 500
 
 if __name__ == '__main__':
+    # 注意：實際上線時請不要開啟 debug 模式，並根據需要設定 host 與 port
     app.run(host='0.0.0.0', port=5000, debug=True)

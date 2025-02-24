@@ -5,6 +5,7 @@ import CodeDiff from './components/CodeDiff';
 import FileList from './components/FileList';
 import RaceCarLoading from './components/RaceCarLoading';
 import './App.css';
+import { unifiedOperation, deploymentFiles, generateUnitTest, deployGKE, processMultiFiles } from './testApiService';
 
 export interface FileRecord {
   fileName: string;
@@ -33,15 +34,15 @@ const App: React.FC = () => {
   const [progress, setProgress] = useState(0);
   const [processingMode, setProcessingMode] = useState("single");
   const [isRethinkModalOpen, setIsRethinkModalOpen] = useState(false);
-  // 新增：儲存每個檔案的測試 log，key 為檔名
+  // 儲存每個檔案的測試 log，key 為檔名
   const [fileLogs, setFileLogs] = useState<{ [fileName: string]: string }>({});
-  // 新增：控制 log Modal 的 state
+  // 控制 log Modal 的 state
   const [logModal, setLogModal] = useState<{ isOpen: boolean; log: string; fileName: string }>({
     isOpen: false,
     log: '',
     fileName: ''
   });
-  //新增 state 儲存測試進度
+  // 儲存測試進度
   const [testProgress, setTestProgress] = useState<string[]>([]);
 
   // 開啟 log Modal 的處理函式
@@ -64,27 +65,9 @@ const App: React.FC = () => {
     setIsRethinkModalOpen(false);
     setIsUpdating(true);
     setProgress(0);
-
     const fileToSend = `### AI Rethink Request:\n\n${prompt}\n\n### File: ${selectedFile.fileName}\n\n${selectedFile.newCode}`;
-    const requestData = JSON.stringify({ prompt: fileToSend });
-    
     try {
-      const response = await fetch('http://140.120.14.104:12345/llm/code/unified_operation', {
-        method: 'POST',
-        headers: { 
-          'Accept': 'application/json', 
-          'Content-Type': 'application/json' 
-        },
-        body: requestData,
-      });
-
-      if (!response.ok) {
-        const errorText = await response.text();
-        throw new Error(`HTTP Error! Status: ${response.status}, Details: ${errorText}`);
-      }
-      const result = await response.json();
-      console.log("AI Rethink 回應結果:", result);
-
+      const result = await unifiedOperation(fileToSend)
       if (result.result) {
         setFiles(prevFiles =>
           prevFiles.map(f =>
@@ -127,7 +110,7 @@ const App: React.FC = () => {
     }
   };
 
-  // ★★★ 新增：產生配置檔( Dockerfile & YAML )並下載檔案 ★★★
+  // 下載檔案並根據newCode產生配置檔後自動部屬
   const handleGenerateConfigs = async () => {
     if (!files || files.length === 0) return;
   
@@ -141,40 +124,20 @@ const App: React.FC = () => {
       link.click();
       URL.revokeObjectURL(url);
     };
-  
+
+    //各個檔案的log
+    const logsObj: Record<string, string> = {};
+
+    //每個檔案檔案下載和自動部屬
     for (const file of files) {
       try {
+        //------------------------Step 1. 產生配置檔並下載--------------------------------------
         // 取得檔案名稱的最後一段
         const fileNamePart = file.fileName.split('/').pop() || 'unknown.txt';
-  
-        // 準備要送出的 payload
-        const requestData = JSON.stringify({
-          file_name: "test_" + fileNamePart,
-          code: file.newCode,
-        });
-  
-        const response = await fetch(
-          'http://140.120.14.104:12345/llm/code/deployment_files',
-          {
-            method: 'POST',
-            headers: {
-              'Accept': 'application/json',
-              'Content-Type': 'application/json',
-            },
-            body: requestData,
-          }
-        );
-  
-        if (!response.ok) {
-          const errorText = await response.text();
-          throw new Error(
-            `HTTP Error! Status: ${response.status}, Details: ${errorText}`
-          );
-        }
-  
-        const result = await response.json();
-        console.log(`部署檔案產生結果 for ${file.fileName}:`, result);
-  
+
+        // 產生配置檔
+        const result = await deploymentFiles(fileNamePart, file.newCode);
+
         // 若後端回傳了 dockerfile 或 yaml，則下載（檔名依據原檔名加上標示）
         if (result.dockerfile) {
           downloadFile(`${fileNamePart}_Dockerfile`, result.dockerfile);
@@ -182,7 +145,7 @@ const App: React.FC = () => {
         if (result.yaml) {
           downloadFile(`${fileNamePart}_deployment.yaml`, result.yaml);
         }
-  
+
         // 下載目前的 newCode，檔名改成「原檔名_fixed.副檔名」
         const fileNameOnly = file.fileName.split('/').pop() || 'converted_code.js';
         let baseName = fileNameOnly;
@@ -194,14 +157,69 @@ const App: React.FC = () => {
         }
         const newFileName = `${baseName}_fixed${extension}`;
         downloadFile(newFileName, file.newCode);
+
+        //------------------------Step 2. 自動部屬----------------------------------------------
+        // 用base64加密
+        const base64YamlContent = b64EncodeUnicode( result.yaml|| '');
+        const base64DockerfileContent = b64EncodeUnicode(result.dockerfile|| '');
+        const base64NewCode = b64EncodeUnicode(file.newCode|| '');
+        const singlePayload = JSON.stringify({
+          code_files: [
+            {
+              filename: file.fileName.split('/').pop() , 
+              content: base64NewCode,
+            }
+          ],
+          job_yaml: base64YamlContent,
+          dockerfile: base64DockerfileContent,
+        });
+
+        try {
+          const deployResult = await deployGKE(singlePayload);
+          // 先確保 logsObj[file.fileName] 有預設值 (空字串)
+          logsObj[file.fileName] = logsObj[file.fileName] || "";
+          
+          if (deployResult.status === "success" && deployResult.kubectl_logs) {
+            const decodedKubectlLogs = atob(deployResult.kubectl_logs);
+            // 累加進去
+            logsObj[file.fileName] += "=== KUBECTL LOGS ===\n" + decodedKubectlLogs + "\n\n";
+          }
+    
+          // 如果後端有回傳 result.logs，就繼續累加
+          if (deployResult.logs) {
+            const decodedLogs = atob(deployResult.logs);
+            logsObj[file.fileName] += "=== EXECUTION LOGS ===\n" + decodedLogs + "\n\n";
+          }
+    
+          // 如果後端以 { file_name, log } 或 { files: [ {file_name, log} ] } 回傳
+          else if (deployResult.file_name && deployResult.log) {
+            logsObj[file.fileName] += `=== ${deployResult.file_name} ===\n` + deployResult.log + "\n\n";
+          } else if (deployResult.files && Array.isArray(deployResult.files)) {
+            deployResult.files.forEach((f: any) => {
+              logsObj[file.fileName] += `=== ${f.file_name} ===\n` + f.log + "\n\n";
+            });
+          }
+    
+        } catch (error) {
+          if (error instanceof Error) {
+            if (error.name === 'AbortError') {
+              console.error("請求超時，後端處理時間過長。");
+            } else {
+              console.error("提交處理後檔案失敗:", error.message);
+            }
+          } else {
+            console.error("提交處理後檔案失敗:", error);
+          }
+        }
       } catch (error) {
         console.error("產生部署檔案失敗 for file:", file.fileName, error);
         alert(`產生配置檔時發生錯誤，檔案: ${file.fileName}`);
       }
     }
+    // 將所有檔案的 log 統一更新到 state
+    setFileLogs(logsObj);
   };
   
-
   // 產生 Dockerfile、yaml、unitTest，並送去 GKE 測試
   const handleTestProject = async () => {
     setIsTesting(true);
@@ -213,69 +231,34 @@ const App: React.FC = () => {
     // 逐一處理每個檔案
     for (let i = 0; i < newFiles.length; i++) {
       const file = newFiles[i];
+      
       // 1. 產生 UnitTest
       try {
-        const requestData = JSON.stringify({
-          code: JSON.stringify(file.newCode)
-        });
-        const response = await fetch(
-          "http://140.120.14.104:12345/llm/code/unit_test",
-          {
-            method: "POST",
-            headers: { 
-              "Accept": "application/json",
-              "Content-Type": "application/json" 
-            },
-            body: requestData,
-          }
+        // 直接呼叫 API 模組的 generateUnitTest 函式
+        const unitTestResult = await generateUnitTest(
+          file.fileName.split('/').pop() || '',
+          file.newCode
         );
-        if (!response.ok) {
-          console.error(`檔案 ${file.fileName} 產生 UnitTest 失敗`);
-          setTestProgress(prev => [...prev, `UnitTest 失敗: ${file.fileName}`]);
-          continue;
-        }
-        const result = await response.json();
-        const unitTestCode = result.unit_test;
-        file.unitTestCode = unitTestCode;
+        file.unitTestCode = unitTestResult.unit_test;
         setTestProgress(prev => [...prev, `UnitTest 產生完成: ${file.fileName}`]);
       } catch (error) {
-        console.error("產生 UnitTest 時發生錯誤:", error);
-        setTestProgress(prev => [...prev, `UnitTest 發生錯誤: ${file.fileName}`]);
+        console.error(`檔案 ${file.fileName} 產生 UnitTest 失敗:`, error);
+        setTestProgress(prev => [...prev, `UnitTest 失敗: ${file.fileName}`]);
         continue;
       }
-  
+      
       // 2. 產生 Dockerfile 與 YAML
       try {
-        const requestDeploy = JSON.stringify({
-          file_name: "test_" + file.fileName.split('/').pop(),
-          code: file.unitTestCode || ""
-        });
-        const secondResponse = await fetch(
-          "http://140.120.14.104:12345/llm/code/deployment_files",
-          {
-            method: "POST",
-            headers: {
-              "Accept": "application/json",
-              "Content-Type": "application/json",
-            },
-            body: requestDeploy,
-          }
-        );
-        if (!secondResponse.ok) {
-          console.error(`檔案 ${file.fileName} 產生部署檔案失敗`);
-          setTestProgress(prev => [...prev, `部署檔案失敗: ${file.fileName}`]);
-          continue;
-        }
-        const secondResult = await secondResponse.json();
-        const dockerfileContent = secondResult.dockerfile;
-        const yamlContent = secondResult.yaml;
-        file.dockerfileContent = dockerfileContent;
-        file.yamlContent = yamlContent;
-
+        const originalName = file.fileName.split('/').pop() || ''; // 例如 "A1-1.java"
+        const newName = originalName.replace('.java', 'Test.java');
+        // 呼叫 API 模組的 deploymentFiles 函式
+        const deployResult = await deploymentFiles(newName, file.unitTestCode || "");
+        file.dockerfileContent = deployResult.dockerfile;
+        file.yamlContent = deployResult.yaml;
         setTestProgress(prev => [...prev, `部署檔案產生完成: ${file.fileName}`]);
       } catch (error) {
-        console.error("產生部署檔案時發生錯誤:", error);
-        setTestProgress(prev => [...prev, `部署檔案發生錯誤: ${file.fileName}`]);
+        console.error(`檔案 ${file.fileName} 產生部署檔案失敗:`, error);
+        setTestProgress(prev => [...prev, `部署檔案失敗: ${file.fileName}`]);
         continue;
       }
     }
@@ -288,6 +271,7 @@ const App: React.FC = () => {
     setIsTesting(false);
   };
 
+  // 轉base64的function
   function b64EncodeUnicode(str: string): string {
     // 將字串先使用 encodeURIComponent 編碼，再用 replace 把 %xx 轉回字元
     return btoa(
@@ -298,83 +282,61 @@ const App: React.FC = () => {
   
   // 送出處理後的檔案到 /submit_files (測試 GKE 部署)
   const sendProcessedFilesToAnotherBackend = async () => {
-    
     // 先篩選出符合條件的檔案
     const processedFiles = files.filter(
       file => file.unitTestCode && file.dockerfileContent && file.yamlContent
     );
-    console.log("processedFiles : ",processedFiles);
+    console.log("processedFiles:", processedFiles);
     // 用來儲存每個檔案回傳的 log
     const logsObj: Record<string, string> = {};
   
     for (const file of processedFiles) {
-
-      console.log("file.unitTestCode : ", file.unitTestCode);
-      console.log("file.yamlContent : ", file.yamlContent);
-      console.log("file.dockerfileContent : ", file.dockerfileContent);
+      console.log("file.unitTestCode:", file.unitTestCode);
+      console.log("file.yamlContent:", file.yamlContent);
+      console.log("file.dockerfileContent:", file.dockerfileContent);
+  
       // 準備單一檔案的 payload
       const base64UnitTestCode = b64EncodeUnicode(file.unitTestCode || '');
-      const base64YamlContent = b64EncodeUnicode(file.yamlContent|| '');
-      const base64DockerfileContent = b64EncodeUnicode(file.dockerfileContent|| '');
+      const base64YamlContent = b64EncodeUnicode(file.yamlContent || '');
+      const base64DockerfileContent = b64EncodeUnicode(file.dockerfileContent || '');
+      const originalName = file.fileName.split('/').pop() || ''; // 例如 "A1-1.java"
+      const newName = originalName.replace('.java', 'Test.java');
+  
       const singlePayload = JSON.stringify({
         code_files: [
           {
-            filename: "test_" + file.fileName.split('/').pop() , 
+            filename: newName,
             content: base64UnitTestCode,
           }
         ],
         job_yaml: base64YamlContent,
         dockerfile: base64DockerfileContent,
       });
-      console.log("送給GKE的檔案 : ", singlePayload);
-      // 設置超時機制
-      const controller = new AbortController();
-      const timeoutId = setTimeout(() => controller.abort(), 100000); // 100 秒後中斷
+      console.log("送給GKE的檔案:", singlePayload);
   
       try {
-        // 逐一送出請求
-        const response = await fetch('http://34.171.66.126/deploy', {
-          method: 'POST',
-          headers: {
-            'Accept': 'application/json',
-            'Content-Type': 'application/json'
-          },
-          body: singlePayload,
-          signal: controller.signal
-        });
-        clearTimeout(timeoutId);
-  
-        if (!response.ok) {
-          const errorText = await response.text();
-          throw new Error(`HTTP Error! Status: ${response.status}, Details: ${errorText}`);
-        }
-  
-        const result = await response.json();
+        // 直接呼叫 API 模組中抽離好的 deployGKE 函式，內部已包含超時與錯誤處理
+        const result = await deployGKE(singlePayload);
         console.log("GKE回傳的log:", result);
-
-        // 先確保 logsObj[file.fileName] 有預設值 (空字串)
+  
+        // 確保 logsObj[file.fileName] 有初始值
         logsObj[file.fileName] = logsObj[file.fileName] || "";
-        
+  
         if (result.status === "success" && result.kubectl_logs) {
           const decodedKubectlLogs = atob(result.kubectl_logs);
-          // 累加進去
           logsObj[file.fileName] += "=== KUBECTL LOGS ===\n" + decodedKubectlLogs + "\n\n";
         }
   
-        // 如果後端有回傳 result.logs，就繼續累加
+        // 處理其他可能回傳的 log 格式
         if (result.logs) {
           logsObj[file.fileName] += "=== EXECUTION LOGS ===\n" + result.logs + "\n\n";
-        }
-  
-        // 如果後端以 { file_name, log } 或 { files: [ {file_name, log} ] } 回傳
-        else if (result.file_name && result.log) {
+        } else if (result.file_name && result.log) {
           logsObj[file.fileName] += `=== ${result.file_name} ===\n` + result.log + "\n\n";
         } else if (result.files && Array.isArray(result.files)) {
           result.files.forEach((f: any) => {
             logsObj[file.fileName] += `=== ${f.file_name} ===\n` + f.log + "\n\n";
           });
         }
-  
       } catch (error) {
         if (error instanceof Error) {
           if (error.name === 'AbortError') {
@@ -394,28 +356,17 @@ const App: React.FC = () => {
   
   // 送單一檔案給後端處理
   const sendFilesToBackend = async (file: FileRecord, prompt: string) => {
+    // 建立要送出的內容，包含使用者 prompt、檔案名稱與原始程式碼
     const fileToSend = `### User Prompt:\n${prompt}\n\n### File: ${file.fileName}\n\n${file.oldCode}`;
-    const requestData = JSON.stringify({
-      prompt: fileToSend
-    });
-    console.log("🔹 送出的 requestData for file:", file.fileName, requestData);
+    console.log("🔹 送出的 requestData for file:", file.fileName, fileToSend);
+  
     try {
-      const response = await fetch('http://140.120.14.104:12345/llm/code/unified_operation', {
-        method: 'POST',
-        headers: { 'Accept': 'application/json', 'Content-Type': 'application/json' },
-        body: requestData,
-      });
-  
-      if (!response.ok) {
-        const errorText = await response.text();
-        console.error(`HTTP Error! Status: ${response.status}, Details: ${errorText}`);
-        throw new Error(`HTTP Error! Status: ${response.status}`);
-      }
-  
-      const result = await response.json();
+      // 呼叫 API 模組中的 unifiedOperation 函式
+      const result = await unifiedOperation(fileToSend);
       console.log("後端回應結果:", result);
   
       if (result.result) {
+        // 更新檔案狀態：將轉換後的程式碼與建議更新到 state
         setFiles(prevFiles =>
           prevFiles.map(f =>
             f.fileName === file.fileName
@@ -453,31 +404,17 @@ const App: React.FC = () => {
 
   // 關聯檔案送給後端
   const sendFilesToMultiBackend = async (files: FileRecord[], prompt: string) => {
+    // 先整理要送出的檔案資料
     const filesToSend = files.map(file => ({
-      file_name: file.fileName.split('/').pop(), 
+      file_name: file.fileName.split('/').pop()|| 'unknown.txt',
       content: file.oldCode,
     }));
   
-    const payload = JSON.stringify({
-      task: prompt,
-      files: filesToSend,
-    });
-
     try {
-      const response = await fetch('http://140.120.14.104:12345/llm/code/process_multi_files', {
-        method: 'POST',
-        headers: {
-          'Accept': 'application/json',
-          'Content-Type': 'application/json',
-        },
-        body: payload,
-      });
-      if (!response.ok) {
-        const errorText = await response.text();
-        throw new Error(`HTTP Error! Status: ${response.status}, Details: ${errorText}`);
-      }
-      const result = await response.json();
+      // 呼叫 API 模組中的 processMultiFiles 函式
+      const result = await processMultiFiles(prompt, filesToSend);
       console.log("後端批次回應結果:", result);
+  
       if (result.files && Array.isArray(result.files)) {
         const updatedFiles = files.map(file => {
           const fileNameOnly = file.fileName.split('/').pop();
@@ -734,7 +671,7 @@ const App: React.FC = () => {
                     }}
                     disabled={selectedFile.loading}
                   >
-                    產生配置檔
+                    自動部屬
                   </button>
                 </div>
               </div>
