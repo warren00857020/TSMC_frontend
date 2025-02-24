@@ -1,5 +1,5 @@
 import React, { useState } from 'react';
-import { FileRecord } from '../App';
+import { FileRecord } from '../types';
 
 interface FileListProps {
   files: FileRecord[];
